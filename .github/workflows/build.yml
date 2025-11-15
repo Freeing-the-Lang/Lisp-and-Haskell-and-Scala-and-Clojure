@@ -1,0 +1,210 @@
+name: "Auto Tag + Auto Release + Spongeelang Runtime — Freeing-the-Lang v5.1"
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+# ----------------------------------------------------
+# 1) AUTO TAG CREATION JOB
+# ----------------------------------------------------
+jobs:
+  auto-tag:
+    name: "Generate Auto Tag"
+    runs-on: ubuntu-latest
+
+    outputs:
+      tag: ${{ steps.tagger.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create Auto Tag
+        id: tagger
+        shell: bash
+        run: |
+          DATE=$(date +'%Y%m%d-%H%M%S')
+          SHORTSHA=$(git rev-parse --short HEAD)
+          TAG="v${DATE}-${SHORTSHA}"
+
+          echo "Generated TAG: $TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+          git tag $TAG
+          git push origin $TAG
+
+
+# ----------------------------------------------------
+# 2) BUILD & RELEASE JOB
+# ----------------------------------------------------
+  build:
+    name: "Build — ${{ matrix.os }}"
+    needs: auto-tag
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+
+      # ------------------------------
+      # CHECKOUT
+      # ------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch Tags
+        run: git fetch --tags
+
+      # ------------------------------
+      # SPONGEELANG AUTO LOAD
+      # ------------------------------
+      - name: Clone Spongeelang
+        shell: bash
+        run: |
+          git clone https://github.com/Freeing-the-Lang/Sponge-lang.git || true
+
+      # ------------------------------
+      # RUST
+      # ------------------------------
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # ------------------------------
+      # TOOLS INSTALL
+      # ------------------------------
+      - name: Install tools (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake llvm clang nasm zip
+
+      - name: Install tools (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install llvm cmake nasm zip || true
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # ------------------------------
+      # UNIVERSAL BUILD DETECT
+      # ------------------------------
+      - name: Universal Build
+        shell: bash
+        run: |
+          echo "🔍 Detecting builder..."
+
+          if [ -f Cargo.toml ]; then
+            echo "🦀 Rust build"
+            cargo build --release || true
+          fi
+
+          if [ -f CMakeLists.txt ]; then
+            echo "🛠 CMake build"
+            mkdir -p build
+            cd build
+            cmake ..
+            cmake --build . --config Release || true
+            cd ..
+          fi
+
+          if [ -f build.sh ]; then
+            echo "📜 Running build.sh"
+            bash build.sh || true
+          fi
+
+      # ------------------------------
+      # PACKAGE
+      # ------------------------------
+      - name: Prepare Release Bundle
+        shell: bash
+        run: |
+          mkdir -p release-bundle
+
+          # Rust output
+          if [ -d target/release ]; then
+            cp -r target/release/* release-bundle/ 2>/dev/null || true
+          fi
+
+          # CMake output
+          if [ -d build ]; then
+            cp -r build release-bundle/build || true
+          fi
+
+          # Spongeelang VM included
+          if [ -d Sponge-lang/build ]; then
+            cp -r Sponge-lang/build release-bundle/sponge_vm || true
+          fi
+
+      # ------------------------------
+      # PROOFLEDGER v2
+      # ------------------------------
+      - name: ProofLedger
+        shell: bash
+        run: |
+          FILECOUNT=$(ls -1 release-bundle | wc -l)
+          TOTALSIZE=$(du -sh release-bundle | cut -f1)
+
+          {
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Tag: ${{ needs.auto-tag.outputs.tag }}"
+            echo "OS: ${{ matrix.os }}"
+            echo "Build-Date: $(date)"
+            echo "File-Count: $FILECOUNT"
+            echo "Artifact-Size: $TOTALSIZE"
+            echo ""
+            echo "SHA256 Tree:"
+          } > release-bundle/proofledger-${{ matrix.os }}.txt
+
+          for f in $(ls release-bundle); do
+            sha256sum "release-bundle/$f" >> release-bundle/proofledger-${{ matrix.os }}.txt 2>/dev/null || true
+          done
+
+      # ------------------------------
+      # ZIP (Windows-safe)
+      # ------------------------------
+      - name: Create ZIP
+        shell: bash
+        run: |
+          OS="${{ runner.os }}"
+
+          if [ "$OS" = "Windows" ]; then
+            echo "📦 Using PowerShell Compress-Archive"
+            powershell.exe -Command "Compress-Archive -Path release-bundle\\* -DestinationPath release-bundle\\FREELANG-${{ matrix.os }}.zip"
+          else
+            echo "📦 Using zip"
+            cd release-bundle
+            zip -r FREELANG-${{ matrix.os }}.zip ./*
+          fi
+
+      # ------------------------------
+      # RELEASE UPLOAD
+      # ------------------------------
+      - name: Upload Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.auto-tag.outputs.tag }}
+          files: |
+            release-bundle/FREELANG-${{ matrix.os }}.zip
+            release-bundle/proofledger-${{ matrix.os }}.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
